@@ -1,3 +1,5 @@
+#![feature(mapped_lock_guards)]
+
 use std::path::PathBuf;
 
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};

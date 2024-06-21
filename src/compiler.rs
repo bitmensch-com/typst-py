@@ -2,8 +2,7 @@ use chrono::{Datelike, Timelike};
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::term::{self, termcolor};
 use ecow::eco_format;
-use typst::diag::{Severity, SourceDiagnostic, StrResult};
-use typst::eval::Tracer;
+use typst::diag::{Severity, SourceDiagnostic, StrResult, Warned};
 use typst::foundations::Datetime;
 use typst::model::Document;
 use typst::syntax::{FileId, Source, Span};
@@ -21,11 +20,9 @@ impl SystemWorld {
         self.reset();
         self.source(self.main()).map_err(|err| err.to_string())?;
 
-        let mut tracer = Tracer::default();
-        let result = typst::compile(self, &mut tracer);
-        let warnings = tracer.warnings();
+        let Warned { output, warnings } = typst::compile(self);
 
-        match result {
+        match output {
             // Export the PDF / PNG.
             Ok(document) => {
                 // Assert format is "pdf" or "png" or "svg"
@@ -45,7 +42,7 @@ impl SystemWorld {
 #[inline]
 fn export_pdf(document: &Document, world: &SystemWorld) -> StrResult<Vec<u8>> {
     let ident = world.input().to_string_lossy();
-    let buffer = typst_pdf::pdf(document, typst::foundations::Smart::Custom(&ident), now());
+    let buffer = typst_pdf::pdf(document, typst::foundations::Smart::Custom(&ident), now(), None);
     Ok(buffer)
 }
 

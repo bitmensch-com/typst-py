@@ -1,15 +1,15 @@
-use std::cell::{Cell, OnceCell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{MappedRwLockWriteGuard, OnceLock, RwLock, RwLockWriteGuard};
 
 use chrono::{DateTime, Datelike, Local};
-use comemo::Prehashed;
 use ecow::eco_format;
 use typst::diag::{FileError, FileResult, StrResult};
 use typst::foundations::{Bytes, Datetime, Dict};
 use typst::syntax::{FileId, Source, VirtualPath};
 use typst::text::{Font, FontBook};
+use typst::utils::LazyHash;
 use typst::{Library, LibraryBuilder, World};
 
 use crate::fonts::{FontSearcher, FontSlot};
@@ -26,24 +26,24 @@ pub struct SystemWorld {
     /// The input path.
     main: FileId,
     /// Typst's standard library.
-    library: Prehashed<Library>,
+    library: LazyHash<Library>,
     /// Metadata about discovered fonts.
-    book: Prehashed<FontBook>,
+    book: LazyHash<FontBook>,
     /// Locations of and storage for lazily loaded fonts.
     fonts: Vec<FontSlot>,
     /// Maps file ids to source files and buffers.
-    slots: RefCell<HashMap<FileId, FileSlot>>,
+    slots: RwLock<HashMap<FileId, FileSlot>>,
     /// The current datetime if requested. This is stored here to ensure it is
     /// always the same within one compilation. Reset between compilations.
-    now: OnceCell<DateTime<Local>>,
+    now: OnceLock<DateTime<Local>>,
 }
 
 impl World for SystemWorld {
-    fn library(&self) -> &Prehashed<Library> {
+    fn library(&self) -> &LazyHash<Library> {
         &self.library
     }
 
-    fn book(&self) -> &Prehashed<FontBook> {
+    fn book(&self) -> &LazyHash<FontBook> {
         &self.book
     }
 
@@ -85,8 +85,8 @@ impl SystemWorld {
     }
 
     /// Access the canonical slot for the given file id.
-    fn slot(&self, id: FileId) -> FileResult<RefMut<FileSlot>> {
-        Ok(RefMut::map(self.slots.borrow_mut(), |slots| {
+    fn slot(&self, id: FileId) -> FileResult<MappedRwLockWriteGuard<FileSlot>> {
+        Ok(RwLockWriteGuard::map(self.slots.write().unwrap(), |slots| {
             slots.entry(id).or_insert_with(|| FileSlot::new(id))
         }))
     }
@@ -108,7 +108,7 @@ impl SystemWorld {
 
     /// Reset the compilation state in preparation of a new compilation.
     pub fn reset(&mut self) {
-        for slot in self.slots.borrow_mut().values_mut() {
+        for slot in self.slots.write().unwrap().values_mut() {
             slot.reset();
         }
         self.now.take();
@@ -177,11 +177,11 @@ impl SystemWorldBuilder {
             input,
             root: self.root,
             main: FileId::new(None, main_path),
-            library: Prehashed::new(LibraryBuilder::default().with_inputs(self.inputs).build()),
-            book: Prehashed::new(searcher.book),
+            library: LazyHash::new(LibraryBuilder::default().with_inputs(self.inputs).build()),
+            book: LazyHash::new(searcher.book),
             fonts: searcher.fonts,
-            slots: RefCell::default(),
-            now: OnceCell::new(),
+            slots: RwLock::default(),
+            now: OnceLock::new(),
         };
         Ok(world)
     }
@@ -256,27 +256,28 @@ impl FileSlot {
 /// Lazily processes data for a file.
 struct SlotCell<T> {
     /// The processed data.
-    data: RefCell<Option<FileResult<T>>>,
+    data: RwLock<Option<FileResult<T>>>,
     /// A hash of the raw file contents / access error.
-    fingerprint: Cell<u128>,
+    fingerprint: RwLock<u128>,
     /// Whether the slot has been accessed in the current compilation.
-    accessed: Cell<bool>,
+    accessed: RwLock<bool>,
 }
 
 impl<T: Clone> SlotCell<T> {
     /// Creates a new, empty cell.
     fn new() -> Self {
         Self {
-            data: RefCell::new(None),
-            fingerprint: Cell::new(0),
-            accessed: Cell::new(false),
+            data: RwLock::new(None),
+            fingerprint: RwLock::new(0),
+            accessed: RwLock::new(false),
         }
     }
 
     /// Marks the cell as not yet accessed in preparation of the next
     /// compilation.
     fn reset(&self) {
-        self.accessed.set(false);
+        let mut accessed = self.accessed.write().unwrap();
+        *accessed = false;
     }
 
     /// Gets the contents of the cell or initialize them.
@@ -285,21 +286,27 @@ impl<T: Clone> SlotCell<T> {
         path: impl FnOnce() -> FileResult<PathBuf>,
         f: impl FnOnce(Vec<u8>, Option<T>) -> FileResult<T>,
     ) -> FileResult<T> {
-        let mut borrow = self.data.borrow_mut();
+        let mut borrow = self.data.write().unwrap();
 
         // If we accessed the file already in this compilation, retrieve it.
-        if self.accessed.replace(true) {
+        if *self.accessed.read().unwrap() {
             if let Some(data) = &*borrow {
                 return data.clone();
             }
+        } else {
+            *self.accessed.write().unwrap() = true;
         }
 
         // Read and hash the file.
         let result = path().and_then(|p| read(&p));
-        let fingerprint = typst::util::hash128(&result);
+        let fingerprint = typst::utils::hash128(&result);
 
         // If the file contents didn't change, yield the old processed data.
-        if self.fingerprint.replace(fingerprint) == fingerprint {
+        let mut the_fingerprint = self.fingerprint.write().unwrap();
+        let old_fingerprint = *the_fingerprint;
+        *the_fingerprint = fingerprint;
+
+        if old_fingerprint == fingerprint {
             if let Some(data) = &*borrow {
                 return data.clone();
             }
